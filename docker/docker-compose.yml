@@ -1,0 +1,99 @@
+# Edge device simulation: drone fleet -> ground station ingest -> MinIO (S3 API) -> MLOps.
+# Validated in CI with `docker compose config`; the images are built in CI.
+# Start locally (optional):  docker compose -f docker/docker-compose.yml up --build
+# Credentials below are local-only placeholders for a throwaway MinIO container.
+
+name: field-data-pipeline
+
+x-s3-env: &s3-env
+  S3_ENDPOINT_URL: http://object-store.backend.lab:9000
+  AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-fieldlab}
+  AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-fieldlab-local-only}
+  AWS_DEFAULT_REGION: eu-central-1
+
+services:
+  edge-simulator:
+    build:
+      context: ..
+      dockerfile: docker/simulator.Dockerfile
+    image: field-data-simulator:local
+    hostname: edge-sim
+    volumes:
+      - field-data:/data
+    networks:
+      edge:
+        ipv4_address: 10.20.0.10
+        aliases: [edge-sim.edge.lab]
+
+  object-store:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    command: ["server", "/export", "--address", ":9000", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-fieldlab}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-fieldlab-local-only}
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    volumes:
+      - object-store:/export
+    networks:
+      backend:
+        ipv4_address: 10.30.0.20
+        aliases: [object-store.backend.lab]
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      retries: 10
+
+  ground-ingest:
+    build:
+      context: ..
+      dockerfile: docker/ingest.Dockerfile
+    image: field-data-ingest:local
+    environment: *s3-env
+    volumes:
+      - field-data:/data
+    depends_on:
+      edge-simulator:
+        condition: service_completed_successfully
+      object-store:
+        condition: service_healthy
+    networks:
+      edge:
+        ipv4_address: 10.20.0.2
+        aliases: [ingest.edge.lab]
+      backend:
+        ipv4_address: 10.30.0.10
+        aliases: [ingest.backend.lab]
+
+  mlops:
+    build:
+      context: ..
+      dockerfile: docker/mlops.Dockerfile
+    image: field-data-mlops:local
+    environment: *s3-env
+    volumes:
+      - field-data:/data
+    depends_on:
+      ground-ingest:
+        condition: service_completed_successfully
+    networks:
+      backend:
+        ipv4_address: 10.30.0.30
+        aliases: [mlops.backend.lab]
+
+networks:
+  edge:
+    ipam:
+      config:
+        - subnet: 10.20.0.0/24
+          gateway: 10.20.0.1
+  backend:
+    ipam:
+      config:
+        - subnet: 10.30.0.0/24
+          gateway: 10.30.0.1
+
+volumes:
+  field-data:
+  object-store:

@@ -1,0 +1,92 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-pipeline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      - name: Install
+        run: pip install -r requirements-dev.txt
+      - name: Lint
+        run: |
+          ruff check .
+          ruff format --check .
+      - name: Unit and integration tests
+        run: pytest -q --junitxml=build/junit.xml
+      - name: Generate field data
+        run: python pipeline.py generate --work build/run
+      - name: Ingest (raw zone, moto S3)
+        run: python pipeline.py ingest --work build/run
+      - name: Validate
+        run: python pipeline.py validate --work build/run
+      - name: Convert (Parquet, JSONL, curated zone)
+        run: python pipeline.py convert --work build/run
+      - name: Version and quality checks
+        run: python pipeline.py version --work build/run
+      - name: Evaluate models
+        run: python pipeline.py evaluate --work build/run
+      - name: Gate on results
+        run: |
+          python - <<'PY'
+          import json, pathlib
+          s = pathlib.Path("build/run/state")
+          v = json.loads((s / "version.json").read_text())
+          i = json.loads((s / "ingest.json").read_text())
+          e = json.loads((s / "evaluate.json").read_text())
+          assert v["checks_failed"] == [], v["checks_failed"]
+          d = v["detection_total"]
+          assert d["detected"] == d["injected"] and d["false_positives"] == 0, d
+          assert i["checksum_mismatches"] == 0 and i["second_push_uploaded"] == 0, i
+          best = e["models"][e["best_model"]]
+          assert best["roc_auc"] > 0.9, best
+          print("gates ok", d, e["best_model"], round(best["f1"], 3))
+          PY
+      - name: Job summary
+        if: always()
+        run: |
+          cat build/run/report/quality_report.md >> "$GITHUB_STEP_SUMMARY" || true
+          cat build/run/report/model_comparison.md >> "$GITHUB_STEP_SUMMARY" || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: quality-report
+          path: |
+            build/run/report/
+            build/run/state/
+            build/run/versions/
+            build/run/mlruns/
+            build/junit.xml
+
+  docker-images:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate compose file
+        run: docker compose -f docker/docker-compose.yml config -q
+      - name: Build images
+        run: |
+          for t in simulator ingest mlops; do
+            docker build -f docker/$t.Dockerfile -t field-data-$t:ci .
+          done
+          docker image ls --format '{{.Repository}}:{{.Tag}} {{.Size}}' | grep field-data
+      - name: Smoke run images on a shared volume (moto S3 inside the ingest image)
+        run: |
+          docker volume create fdp-data
+          docker run --rm -v fdp-data:/data field-data-simulator:ci
+          docker run --rm -v fdp-data:/data field-data-ingest:ci
+          docker run --rm -v fdp-data:/data field-data-mlops:ci
+          docker run --rm -v fdp-data:/data field-data-mlops:ci cat /data/report/quality_report.md
